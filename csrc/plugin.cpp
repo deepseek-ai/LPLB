@@ -120,7 +120,8 @@ struct vector_string_hash {
 void shared_mkdir(const std::string name) { mkdir(name.c_str(), 0775); }
 
 struct compiled_solver {
-  cudaKernel_t kernel_solve = nullptr, kernel_map_idx = nullptr,
+  cudaKernel_t kernel_solve = nullptr, kernel_edge_balance = nullptr,
+               kernel_map_idx = nullptr,
                kernel_count_idx = nullptr;
   cudaLibrary_t module = nullptr;
   int n_group;
@@ -174,6 +175,9 @@ struct compiled_solver {
                                    NULL));                // includeNames
 
     const std::string mathdx_path = resource_path + "/mathdx/";
+    const char *cuda_home_env = getenv("CUDA_HOME");
+    const std::string cuda_home =
+        cuda_home_env ? cuda_home_env : "/usr/local/cuda";
 
     // specify that LTO IR should be generated for LTO operation
     std::vector<std::string> opts{
@@ -185,7 +189,9 @@ struct compiled_solver {
         "-DDUP_PER_RANK=" + std::to_string(dup_per_rank),
         "-DSM_Ver=" + std::to_string(arch * 10),
         "-DBLOCK_DIM=" + std::to_string(block_dim),
-        "-I/usr/local/cuda/include",
+        "-I" + cuda_home + "/include",
+        "-I" + cuda_home + "/targets/x86_64-linux/include",
+        "-I" + cuda_home + "/targets/x86_64-linux/include/cccl",
         "-default-device",
         "-arch=sm_" + std::to_string(arch),
 #ifdef USE_NVSHMEM
@@ -330,6 +336,8 @@ struct compiled_solver {
     CUDA_CHECK(cudaLibraryLoadFromFile(&module, cubin.c_str(), nullptr, nullptr,
                                        0, nullptr, nullptr, 0));
     CUDA_CHECK(cudaLibraryGetKernel(&kernel_solve, module, "kernel_solve"));
+    CUDA_CHECK(cudaLibraryGetKernel(&kernel_edge_balance, module,
+                                    "kernel_edge_balance"));
     CUDA_CHECK(cudaLibraryGetKernel(&kernel_map_idx, module, "kernel_map_idx"));
     CUDA_CHECK(
         cudaLibraryGetKernel(&kernel_count_idx, module, "kernel_count_idx"));
@@ -577,6 +585,67 @@ struct compiled_solver {
     return {result, global_workload};
   }
 
+  std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+  edge_balance(at::Tensor local_workload, at::Tensor r2o,
+               at::Tensor phy2log, at::Tensor colored_edges,
+               at::Tensor color_offsets, int max_sweeps, float tolerance) {
+    LPLB_ASSERT(local_workload.dim() == 3);
+    LPLB_ASSERT(local_workload.size(0) == n_group);
+    LPLB_ASSERT(local_workload.size(1) == group_size);
+    LPLB_ASSERT(local_workload.dtype() == torch::kInt32);
+    LPLB_ASSERT(local_workload.is_contiguous());
+    LPLB_ASSERT(r2o.dtype() == torch::kInt32);
+    LPLB_ASSERT(r2o.is_contiguous());
+    LPLB_ASSERT(phy2log.dtype() == torch::kInt32);
+    LPLB_ASSERT(phy2log.is_contiguous());
+    LPLB_ASSERT(colored_edges.dtype() == torch::kInt32);
+    LPLB_ASSERT(colored_edges.is_contiguous());
+    LPLB_ASSERT(color_offsets.dtype() == torch::kInt32);
+    LPLB_ASSERT(color_offsets.is_contiguous());
+
+    int n_logical_experts_per_rank = local_workload.size(2);
+    int n_pes = n_group * group_size;
+    int n_physical_experts_per_rank = phy2log.numel() / n_pes;
+    int n_experts_per_var =
+        (n_physical_experts_per_rank - n_logical_experts_per_rank) /
+        dup_per_rank;
+    int n_experts_fixed =
+        n_logical_experts_per_rank - dup_per_rank * n_experts_per_var;
+    int n_colors = color_offsets.numel() - 1;
+
+    auto float_options = local_workload.options().dtype(torch::kFloat32);
+    auto int_options = local_workload.options().dtype(torch::kInt32);
+    auto result = at::empty({n_group, group_size, dup_per_rank}, float_options);
+    auto final_load = at::empty({n_group, group_size}, float_options);
+    auto max_load = at::empty({n_group}, float_options);
+    auto num_sweeps = at::empty({n_group}, int_options);
+    auto converged = at::empty({n_group}, int_options);
+
+    void *p_workload = local_workload.data_ptr();
+    void *p_r2o = r2o.data_ptr();
+    void *p_phy2log = phy2log.data_ptr();
+    void *p_colored_edges = colored_edges.data_ptr();
+    void *p_color_offsets = color_offsets.data_ptr();
+    void *p_result = result.data_ptr();
+    void *p_final_load = final_load.data_ptr();
+    void *p_max_load = max_load.data_ptr();
+    void *p_num_sweeps = num_sweeps.data_ptr();
+    void *p_converged = converged.data_ptr();
+    void *args[] = {&p_workload, &p_r2o, &p_phy2log,
+                    &n_experts_per_var, &n_experts_fixed,
+                    &p_colored_edges, &p_color_offsets, &n_colors,
+                    &max_sweeps, &tolerance, &p_result, &p_final_load,
+                    &p_max_load, &p_num_sweeps, &p_converged};
+    int edge_smem_size = sizeof(float) *
+                         (group_size + 2 * group_size * dup_per_rank + 2) +
+                         2 * sizeof(int);
+    cudaStream_t cuda_stream = c10::cuda::getCurrentCUDAStream().stream();
+    CUDA_CHECK(cudaLaunchKernel(kernel_edge_balance,
+                                {(unsigned)n_group, 1, 1}, {32, 1, 1}, args,
+                                edge_smem_size, cuda_stream));
+    return {result, final_load, max_load, num_sweeps, converged};
+  }
+
   std::pair<at::Tensor, at::Tensor> count_idx(at::Tensor idx, int n_sms,
                                               int block_dim) {
     LPLB_ASSERT(idx.dtype() == torch::kInt64);
@@ -671,6 +740,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
       .def("solve", &compiled_solver::solve, "local_workload"_a, "r2o"_a,
            "phy2log"_a, "avail_num"_a)
+      .def("edge_balance", &compiled_solver::edge_balance,
+           "local_workload"_a, "r2o"_a, "phy2log"_a,
+           "colored_edges"_a, "color_offsets"_a, "max_sweeps"_a,
+           "tolerance"_a)
       .def("count_idx", &compiled_solver::count_idx, "idx"_a, "n_sms"_a,
            "block_dim"_a)
       .def("map_idx", &compiled_solver::map_idx, "mapping_idx"_a, "o_weight"_a,

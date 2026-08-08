@@ -54,6 +54,24 @@ indices = ...
 redirected_indices = planner.run(indices, avail_counter, N_SMS)
 ```
 
+### Experimental edge-balance solver
+
+`Planner.edge_balance_probs()` provides a graph-native experimental solver that
+updates nonconflicting replica edges in parallel using a cached greedy edge
+coloring. It currently supports groups of at most 32 ranks and standard
+`torch.distributed` workload reduction, but not the DeepEP communication path.
+
+```python
+probs, final_load, max_load, sweeps, converged = planner.edge_balance_probs(
+    current_workload,
+    max_sweeps=64,
+    tolerance=1e-5,
+)
+```
+
+See [EDGE_BALANCE.md](EDGE_BALANCE.md) for the formulation, implementation, and
+experimental benchmark results.
+
 ## How LPLB Works
 
 LPLB extends **EPLB** (Expert Parallelism Load Balancer) to address **dynamic load imbalance** in Mixture-of-Experts (MoE) training. While EPLB handles static imbalances (e.g., consistently overloaded experts due to data distribution), LPLB targets per-batch fluctuations caused by small-batch randomness during training.

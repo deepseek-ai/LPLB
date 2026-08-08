@@ -7,3 +7,4 @@ __pycache__/
 lplb/resources/mathdx/
 nvidia-mathdx-*.tar.gz
 .vscode/
+benchmark-results/

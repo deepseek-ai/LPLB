@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from lplb._cpp import CompiledSolver
+from lplb.edge_coloring import color_replica_graph
 from lplb.eplb import rebalance_experts
 
 
@@ -63,7 +64,7 @@ class Planner:
         :param ep_size: Total number of EP ranks. Defaults to `group.size()`. Must be provided if `group` is None.
         :param group: EP communication group. Defaults to None, meaning no workload reduction is performed.
         """
-        self.r2o = redundant_to_original.int().cuda()
+        self.r2o = redundant_to_original.int().cuda().contiguous()
         self.o2r = self.r2o.argsort(dim=0).int().contiguous()
         self.group_size, self.num_redundants = self.r2o.shape[0], self.r2o.shape[1]
 
@@ -92,6 +93,7 @@ class Planner:
 
         self.ep_group = group
         self.deep_ep_initialized = False
+        self._edge_coloring: tuple[torch.Tensor, torch.Tensor] | None = None
         self.solver = _get_solver(
             self.n_group,
             self.group_size,
@@ -215,6 +217,45 @@ class Planner:
             workload = workload.clone()
             torch.distributed.all_reduce(workload, group=self.ep_group)
         return self.solver.solve(workload, self.r2o, self.phy2log, avail_counter)
+
+    def edge_balance_probs(
+        self,
+        workload: torch.Tensor,
+        max_sweeps: int = 64,
+        tolerance: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Solve with experimental edge-colored coordinate balancing.
+
+        Returns routing probabilities, final loads, maximum loads, completed
+        sweep counts, and convergence flags.
+        """
+        if max_sweeps <= 0:
+            raise ValueError('max_sweeps must be positive')
+        if tolerance < 0:
+            raise ValueError('tolerance must be nonnegative')
+        if self.deep_ep_initialized:
+            raise NotImplementedError('edge balance does not yet support DeepEP communication')
+        if self._edge_coloring is None:
+            self._edge_coloring = color_replica_graph(self.r2o)
+        colored_edges, color_offsets = self._edge_coloring
+
+        workload = workload.view(
+            self.n_group,
+            self.group_size,
+            self.n_local_logical_routed_experts,
+        )
+        if self.ep_group is not None:
+            workload = workload.clone()
+            torch.distributed.all_reduce(workload, group=self.ep_group)
+        return self.solver.edge_balance(
+            workload,
+            self.r2o,
+            self.phy2log,
+            colored_edges,
+            color_offsets,
+            max_sweeps,
+            tolerance,
+        )
 
     def weighted_select_target(
         self,
