@@ -401,6 +401,134 @@ extern "C" __global__ void kernel_solve(
   __syncthreads();
 }
 
+// Edge-coordinate load balancing for offline solver experiments. Edges are
+// indexed by (destination rank, replica slot); r2o stores the source rank.
+// color_offsets/colored_edges describe matchings, so endpoint updates need no
+// atomics. One warp solves one independent topology group.
+struct edge_balance_smem {
+  float load[GROUP_SIZE];
+  float flow[GROUP_SIZE * DUP_PER_RANK];
+  float capacity[GROUP_SIZE * DUP_PER_RANK];
+  float scale;
+  float max_change;
+  int completed_sweeps;
+  int converged;
+};
+
+extern "C" __global__ void kernel_edge_balance(
+    const int *workload, const int *r2o, const int *phy2log,
+    int n_experts_per_var, int n_experts_fixed, const int *colored_edges,
+    const int *color_offsets, int n_colors, int max_sweeps, float tolerance,
+    float *result, float *final_load, float *max_load, int *num_sweeps,
+    int *converged) {
+  static_assert(GROUP_SIZE <= 32, "edge solver uses one warp per group");
+  const int pid = blockIdx.x;
+  const int tid = threadIdx.x;
+  constexpr int E = GROUP_SIZE * DUP_PER_RANK;
+  const int n_logical_per_rank = DUP_PER_RANK * n_experts_per_var + n_experts_fixed;
+  const int n_physical_per_rank = n_logical_per_rank + DUP_PER_RANK * n_experts_per_var;
+  const int n_experts = gridDim.x * GROUP_SIZE * n_logical_per_rank;
+  extern __shared__ edge_balance_smem shared[];
+  auto &smem = shared[0];
+
+  float local_max = 0.0f;
+  for (int i = tid; i < n_experts; i += 32)
+    local_max = fmaxf(local_max, (float)workload[i]);
+  for (int offset = 16; offset > 0; offset >>= 1)
+    local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+  if (tid == 0)
+    smem.scale = fmaxf(local_max, 1.0f);
+  __syncthreads();
+
+  const int *group_phy2log = phy2log + pid * GROUP_SIZE * n_physical_per_rank;
+  for (int e = tid; e < E; e += 32) {
+    const int duplicate = e % DUP_PER_RANK;
+    const int source = r2o[e];
+    float capacity = 0.0f;
+    for (int j = 0; j < n_experts_per_var; ++j)
+      capacity += workload[group_phy2log[source * n_physical_per_rank +
+                                         j * DUP_PER_RANK + duplicate]];
+    smem.capacity[e] = capacity / smem.scale;
+    smem.flow[e] = 0.5f * smem.capacity[e];
+  }
+  __syncthreads();
+
+  for (int rank = tid; rank < GROUP_SIZE; rank += 32) {
+    float value = 0.0f;
+    for (int j = 0; j < n_experts_fixed; ++j)
+      value += workload[group_phy2log[rank * n_physical_per_rank +
+                                      DUP_PER_RANK * n_experts_per_var + j]];
+    value /= smem.scale;
+    for (int e = 0; e < E; ++e) {
+      const int source = r2o[e];
+      const int destination = e / DUP_PER_RANK;
+      if (source == rank)
+        value += smem.capacity[e] - smem.flow[e];
+      if (destination == rank)
+        value += smem.flow[e];
+    }
+    smem.load[rank] = value;
+  }
+  if (tid == 0) {
+    smem.completed_sweeps = 0;
+    smem.converged = 0;
+  }
+  __syncthreads();
+
+  for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+    float thread_max_change = 0.0f;
+    for (int color = 0; color < n_colors; ++color) {
+      for (int position = color_offsets[color] + tid;
+           position < color_offsets[color + 1]; position += 32) {
+        const int e = colored_edges[position];
+        const int source = r2o[e];
+        const int destination = e / DUP_PER_RANK;
+        const float old_flow = smem.flow[e];
+        const float desired = 0.5f * (smem.load[source] - smem.load[destination]);
+        const float delta = fminf(fmaxf(desired, -old_flow),
+                                  smem.capacity[e] - old_flow);
+        smem.flow[e] = old_flow + delta;
+        smem.load[source] -= delta;
+        smem.load[destination] += delta;
+        thread_max_change = fmaxf(thread_max_change, fabsf(delta));
+      }
+      __syncthreads();
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+      thread_max_change = fmaxf(
+          thread_max_change,
+          __shfl_down_sync(0xffffffff, thread_max_change, offset));
+    if (tid == 0) {
+      smem.max_change = thread_max_change;
+      smem.completed_sweeps = sweep + 1;
+      smem.converged = thread_max_change <= tolerance;
+    }
+    __syncthreads();
+    if (smem.converged)
+      break;
+  }
+
+  for (int e = tid; e < E; e += 32) {
+    const int source = r2o[e];
+    const int duplicate = e % DUP_PER_RANK;
+    const float fraction = smem.capacity[e] > 0.0f
+                               ? 1.0f - smem.flow[e] / smem.capacity[e]
+                               : 0.5f;
+    result[pid * E + source * DUP_PER_RANK + duplicate] = fraction;
+  }
+  for (int rank = tid; rank < GROUP_SIZE; rank += 32)
+    final_load[pid * GROUP_SIZE + rank] = smem.load[rank] * smem.scale;
+
+  float group_max = tid < GROUP_SIZE ? smem.load[tid] : -1.0e30f;
+  for (int offset = 16; offset > 0; offset >>= 1)
+    group_max = fmaxf(group_max, __shfl_down_sync(0xffffffff, group_max, offset));
+  if (tid == 0) {
+    max_load[pid] = group_max * smem.scale;
+    num_sweeps[pid] = smem.completed_sweeps;
+    converged[pid] = smem.converged;
+  }
+}
+
 int split_and_align(int n, int par_rank, int par_size, int align) {
   int n_per_rank = (n + par_size - 1) / par_size;
   n_per_rank = (n_per_rank + align - 1) / align * align;
