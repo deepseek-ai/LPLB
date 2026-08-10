@@ -147,3 +147,18 @@ The current evidence is based on synthetic workloads and the reconstructed LPLB 
 - Consumers that may require distinct output storage rather than reusable buffers.
 
 The current convergence test detects a coordinatewise fixed point. HiGHS comparisons show near-optimal solutions on this corpus, but a general global-optimality guarantee should rely on a valid primal-dual certificate or a separate proof for the graph model.
+
+## Research Status
+
+The edge-balance implementation and accompanying technical blog were developed
+by Bochuan Lyu. Bochuan Lyu and Zedong Peng are currently extending this work
+through end-to-end evaluations in inference systems. The broader algorithmic
+analysis and experimental results are intended for inclusion in a future
+research paper.
+
+If you build on the current implementation, please reference the upstream LPLB
+project, the Edge Balance implementation branch, and the technical blog:
+
+- Upstream project: [deepseek-ai/LPLB](https://github.com/deepseek-ai/LPLB)
+- Edge Balance implementation: [BochuanBob/LPLB — feature/edge-balance-solver](https://github.com/BochuanBob/LPLB/tree/feature/edge-balance-solver)
+- Technical blog: [A Graph-Native CUDA Solver for MoE Load Balancing](https://bochuanbob.github.io/lplb-edge-balance/)
