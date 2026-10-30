@@ -252,7 +252,7 @@ class Planner:
         Assign physical expert indices to the given logical expert indices.
 
         :param idx: Selected logical expert indices (range: [-1, n_logical_routed_experts)).
-        :param avail_counter: Counter of available physical expert indices (shape: (n_routed_experts,)).
+        :param avail_counter: Feasible solution counter, a 0-dim (numel == 1) int32 CUDA tensor.
         :param n_sms: Number of CUDA streaming multiprocessors used.
         :return: Mapped physical expert indices (same shape as `idx`, range: [-1, n_routed_experts)).
         """
