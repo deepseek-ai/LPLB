@@ -29,7 +29,7 @@ pytest tests
 
 ```python
 # Global successes counter
-avail_counter = torch.zeros(1, dtype=torch.int64, device="cuda")
+avail_counter = torch.zeros((), dtype=torch.int32, device="cuda")
 # Define topology of redundant experts
 r2o = torch.tensor(
     [
