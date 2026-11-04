@@ -502,7 +502,18 @@ kernel_map_idx(const long *mapping_idx, const float *o_weight,
     int idx_out;
     if (idx != -1) {
       auto computed_count = atomicAdd(&smem_current_count[idx], 1);
-      computed_count = (computed_count * 499 + 41) % smem_total_count[idx];
+      // 499 is prime, so it permutes positions unless the count is a
+      // multiple of 499. Use a rotation for that case. Unsigned arithmetic
+      // avoids signed overflow; widen only when the product cannot fit.
+      const auto total_count = static_cast<unsigned int>(smem_total_count[idx]);
+      const auto ordinal = static_cast<unsigned int>(computed_count);
+      constexpr auto max_fast_count = (~0u - 41u) / 499u + 1u;
+      if (total_count % 499u == 0)
+        computed_count = (ordinal + 41u) % total_count;
+      else if (total_count <= max_fast_count)
+        computed_count = (ordinal * 499u + 41u) % total_count;
+      else
+        computed_count = (static_cast<unsigned long long>(ordinal) * 499u + 41u) % total_count;
       idx_out =
           smem_log2r[mapping_idx[i] * 2 +
                      (computed_count >= smem_expected_count[mapping_idx[i]])];

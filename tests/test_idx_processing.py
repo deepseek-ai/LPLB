@@ -6,6 +6,42 @@ from tests.utils import CUBE_8P2E
 
 
 @pytest.mark.parametrize(
+    ('num_tokens', 'weight'),
+    [
+        (0, 0.5),
+        (1, 0.5),
+        (498, 0.5),
+        (499, 0.0),
+        (499, 0.25),
+        (499, 0.5),
+        (499, 0.75),
+        (499, 1.0),
+        (500, 0.5),
+        (998, 0.5),
+        (1497, 0.25),
+        (1497, 0.5),
+        (4_304_000, 0.5),
+        (8_608_000, 0.5),
+    ],
+)
+def test_weighted_select_target_preserves_requested_split(num_tokens: int, weight: float) -> None:
+    planner = Planner(CUBE_8P2E, 272, 256, ep_size=8)
+    _phy2log, log2phy, _logcnt = planner.update_redundancy_mapping()
+    idx = torch.zeros(num_tokens, dtype=torch.int64, device='cuda')
+    weights = torch.full((1, 8, 2), weight, dtype=torch.float32, device='cuda')
+
+    _, workload_by_sm = planner.count_workload(idx, n_sms=4)
+    mapped = planner.weighted_select_target(idx, weights, workload_by_sm, n_sms=4)
+
+    # Expert 0 has one original and one replica.
+    originals = (mapped == log2phy[0, 0]).sum().item()
+    replicas = (mapped == log2phy[0, 1]).sum().item()
+    expected_originals = int(num_tokens * weight)
+    assert originals == expected_originals
+    assert replicas == num_tokens - expected_originals
+
+
+@pytest.mark.parametrize(
     ('r2o', 'n_logical_experts', 'ep_size', 'n_redundants_per_rank'),
     [(CUBE_8P2E, 256, 32, 2)],
 )
