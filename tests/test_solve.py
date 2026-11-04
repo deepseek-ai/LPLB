@@ -10,6 +10,18 @@ from tests.utils import (
 )
 
 
+def test_planner_solve_zero_workload() -> None:
+    planner = Planner(CUBE_8P2E, 272, 256, ep_size=8)
+    workload = torch.zeros(256, dtype=torch.int32, device='cuda')
+    avail_counter = torch.zeros((), dtype=torch.int32, device='cuda')
+
+    probs, global_workload = planner.solve_probs(workload, avail_counter)
+
+    assert torch.isfinite(probs).all()
+    assert torch.isfinite(global_workload).all()
+    assert torch.count_nonzero(global_workload) == 0
+
+
 @pytest.mark.parametrize(
     ('r2o', 'n_logical_experts', 'ep_size', 'n_redundants_per_rank', 'with_reorder', 'tolerance'),
     [

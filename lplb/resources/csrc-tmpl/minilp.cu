@@ -170,6 +170,8 @@ extern "C" __global__ void kernel_solve(
         for (int offset = 16; offset > 0; offset >>= 1)
           workload_max = fmaxf(
               workload_max, __shfl_xor_sync(0xffffffff, workload_max, offset));
+        if (workload_max == 0.0f)
+          workload_max = 1.0f;
         for (int i = tid; i < n_experts; i += 32)
           global_workload[i] /= workload_max;
       }
@@ -185,6 +187,8 @@ extern "C" __global__ void kernel_solve(
       for (int offset = 16; offset > 0; offset >>= 1)
         workload_max = fmaxf(workload_max,
                              __shfl_xor_sync(0xffffffff, workload_max, offset));
+      if (workload_max == 0.0f)
+        workload_max = 1.0f;
       for (int i = tid; i < n_experts; i += 32)
         global_workload[i] = workload[i] / workload_max;
 #ifdef DEBUG_DUMP
