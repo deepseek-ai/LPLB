@@ -20,6 +20,7 @@
 #include <nvJitLink.h>
 #include <nvrtc.h>
 
+#include <cstdlib>
 #include <dlfcn.h>
 #include <fstream>
 #include <map>
@@ -176,6 +177,13 @@ struct compiled_solver {
     const std::string mathdx_path = resource_path + "/mathdx/";
 
     // specify that LTO IR should be generated for LTO operation
+    const char *cuda_home = std::getenv("CUDA_HOME");
+    if (!cuda_home || !*cuda_home)
+      cuda_home = std::getenv("CUDA_PATH");
+    if (!cuda_home || !*cuda_home)
+      cuda_home = "/usr/local/cuda";
+    const auto cuda_include = std::filesystem::path(cuda_home) / "include";
+
     std::vector<std::string> opts{
         "-dlto",
         "--relocatable-device-code=true",
@@ -185,7 +193,8 @@ struct compiled_solver {
         "-DDUP_PER_RANK=" + std::to_string(dup_per_rank),
         "-DSM_Ver=" + std::to_string(arch * 10),
         "-DBLOCK_DIM=" + std::to_string(block_dim),
-        "-I/usr/local/cuda/include",
+        "-I" + cuda_include.string(),
+        "-I" + (cuda_include / "cccl").string(),
         "-default-device",
         "-arch=sm_" + std::to_string(arch),
 #ifdef USE_NVSHMEM

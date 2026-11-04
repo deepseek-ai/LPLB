@@ -11,6 +11,9 @@ LPLB is currently in the early research stage, and performance improvements are 
 - CUDA Toolkit >= 12.6.3 (with cuSolverDx dependencies).
 - DeepEP is optional but **strongly recommended** for practical use.
 - EPLB is embedded.
+- If CUDA is installed outside `/usr/local/cuda`, set `CUDA_HOME` (or
+  `CUDA_PATH`) to the toolkit root both when building and when running LPLB.
+  The runtime compiler also searches the toolkit's `include/cccl` directory.
 
 ```bash
 ./download-mathdx.sh
